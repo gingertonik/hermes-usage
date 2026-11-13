@@ -68,15 +68,14 @@ def write_rollup(db_conn: sqlite3.Connection, out_path: Path, date_str: str) -> 
 
 
 def main(argv: list[str]) -> int:
-    today = datetime.now().date()
-    if len(argv) > 1:
-        date_str = argv[1]
-    else:
-        date_str = (today - timedelta(days=1)).isoformat()  # nightly: roll up yesterday
     home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    if len(argv) > 1:
+        dates = argv[1:]
+    else:
+        dates = [(datetime.now().date() - timedelta(days=1)).isoformat()]  # nightly: yesterday
+    conn = hu.connect_ro(home)  # busy_timeout: a 03:17 WAL checkpoint must not kill the run
     out = home / "cache" / "usage_daily.jsonl"
-    conn = sqlite3.connect(f"{(home / 'state.db').resolve().as_uri()}?mode=ro", uri=True)
-    print(write_rollup(conn, out, date_str))
+    print(sum(write_rollup(conn, out, d) for d in dates))
     return 0
 
 

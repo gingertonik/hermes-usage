@@ -6,11 +6,13 @@ INSERTs, cited in comments; none was produced by running the implementation.
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import hermes_usage as hu
@@ -49,6 +51,10 @@ def make_fixture(tmpdir: str, wal: bool = True):
     conn.execute("INSERT INTO sessions VALUES ('s2','local','claude-opus-5-5[1m]',?,0,0,0,0,'estimated',20)", (t,))
     conn.execute("INSERT INTO sessions VALUES ('s3','subagent','claude-opus-5-5',?,0,0,0,0,'estimated',5)", (t,))
     _usage(conn, "s1", "swift-1.5-iq3_s", "custom", "", 10, 1000, 200, 50, 20, 5, 0, 0, "none", t, t + 100)
+    # review fix fixture: same session/model/provider, second cost_source group ('' + vision
+    # task) — mirrors the live DB (swift rows exist under cost_source '' and 'none' together).
+    # swift api total 10+1+1=12; distinct sessions stay 2; est/act stay 0 with a 'none' group.
+    _usage(conn, "s1", "swift-1.5-iq3_s", "custom", "vision", 1, 0, 0, 0, 0, 0, 0, 0, "", t, t + 100)
     # s2 switches models mid-session: swift owns [t, t+10], opus takes [t+10, t+100]
     _usage(conn, "s2", "swift-1.5-iq3_s", "custom", "", 1, 0, 0, 0, 0, 0, 0, 0, "none", t, t + 10)
     _usage(conn, "s2", "claude-opus-5-5[1m]", OPUS_PROVIDER, "", 7, 900, 300, 0, 0, 100, 1.5, 0, "", t + 10, t + 100)
@@ -249,6 +255,19 @@ class Report(unittest.TestCase):
         out = hu.build_report(self.conn, hu.parse_args([]), self.NOW)
         self.assertIn("sessions counted per model", out)
 
+    def test_sessions_dedupe_across_cost_source_groups(self):
+        # fixture: s1 swift sits in TWO cost_source groups ('none','' after fixture add);
+        # distinct sessions for swift = 2 (s1, s2); group-sum would print 3
+        out = hu.build_report(self.conn, hu.parse_args([]), self.NOW)
+        swift = next(l for l in out.splitlines() if "swift-1.5-iq3_s" in l)
+        self.assertEqual(swift.split()[1], "2")
+
+    def test_unpriced_dash_survives_cost_source_split(self):
+        # s1 swift groups: est/act all 0, one group cost_source='none' -> spec: em dash, not $0.00
+        out = hu.build_report(self.conn, hu.parse_args([]), self.NOW)
+        swift = next(l for l in out.splitlines() if "swift-1.5-iq3_s" in l)
+        self.assertTrue(swift.rstrip().endswith("—"))
+
     def test_header_session_count_respects_user_filter(self):
         # fixture: 3 distinct sessions (s1,s2,s3); s3 is source='subagent' -> user-only = 2
         out_all = hu.build_report(self.conn, hu.parse_args([]), self.NOW)
@@ -346,8 +365,9 @@ class Trend(unittest.TestCase):
         date_str = datetime.fromtimestamp(1_700_000_000).date().isoformat()
         rows = {r["model"]: r for r in self.rollup.rollup_day(self.conn, date_str)}
         swift = rows["swift-1.5-iq3_s"]
+        # expected 12: 10 (s1 main) + 1 (s2 window row) + 1 (s1 vision) after fixture add
         self.assertEqual((swift["sessions"], swift["api_calls"], swift["in_tok"], swift["out_tok"]),
-                         (2, 11, 1000, 200))
+                         (2, 12, 1000, 200))
         opus = rows["claude-opus-5-5"]
         self.assertEqual((opus["sessions"], opus["api_calls"]), (2, 12))
         self.assertAlmostEqual(opus["est_cost"], 2.2, places=6)  # 1.5 + 0.2 + 0.5
@@ -369,6 +389,43 @@ class Trend(unittest.TestCase):
     def test_render_trend_missing_file(self):
         missing = Path(self._tmp.name) / "nope.jsonl"
         self.assertIn(str(missing), hu.render_trend(missing, 30))
+
+    def test_trend_last_shows_recent_nonzero_day(self):
+        # steady state: cron fills YESTERDAY at 03:17, today is empty until night.
+        # "last" must name the most recent day with cost, with its date label.
+        today = datetime.now().date()
+        y = (today - timedelta(days=1)).isoformat()
+        t = today.isoformat()
+        p = Path(self._tmp.name) / "u.jsonl"
+        p.write_text(
+            json.dumps({"date": y, "model": "m1", "est_cost": 5.0, "act_cost": 0.0, "out_tok": 10}) + "\n"
+            + json.dumps({"date": t, "model": "m1", "est_cost": 0.0, "act_cost": 0.0, "out_tok": 0}) + "\n")
+        out = hu.render_trend(p, 7)
+        self.assertIn(f"on {y}", out)
+        self.assertNotIn("last $0.00", out)
+
+    def test_rollup_main_multi_dates_and_connect_path(self):
+        # backfill: main accepts multiple dates; must connect via hu.connect_ro
+        # (busy_timeout) — connect path pinned with a spy (unavoidable: no unit to inspect)
+        calls = []
+        real = self.rollup.hu.connect_ro
+        def spy(home=None):
+            calls.append(home)
+            return real(home)
+        self.rollup.hu.connect_ro = spy
+        try:
+            os.environ["HERMES_HOME"] = self._tmp.name  # fixture state.db sits at tmp root
+            d0 = datetime.fromtimestamp(1_700_000_000).date().isoformat()
+            d1 = (datetime.fromtimestamp(1_700_000_000) + timedelta(days=1)).date().isoformat()
+            rc = self.rollup.main([self.rollup.__file__, d0, d1])
+        finally:
+            self.rollup.hu.connect_ro = real
+            os.environ.pop("HERMES_HOME", None)
+        self.assertEqual(rc, 0)
+        self.assertTrue(calls)
+        dates = {json.loads(l)["date"] for l in
+                 Path(self._tmp.name, "cache", "usage_daily.jsonl").read_text().splitlines()}
+        self.assertIn(d0, dates)
 
     def test_main_trend_exit_zero(self):
         # --trend must render the trend view (note line pre-rollup), not the table

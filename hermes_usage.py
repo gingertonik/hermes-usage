@@ -286,10 +286,12 @@ def build_report(conn: sqlite3.Connection, args: argparse.Namespace, now: float)
 
 def render_tasks(conn: sqlite3.Connection, cutoff: float | None,
                  exclude_sources: tuple[str, ...]) -> str:
-    """Per-model aux-task split: one section per billing family, (model:task) rows by calls desc."""
-    sql = ("SELECT model, billing_provider, task, SUM(api_call_count) AS calls, "
-           "SUM(input_tokens) AS in_tok, SUM(output_tokens) AS out_tok, "
-           "SUM(estimated_cost_usd) AS est, SUM(actual_cost_usd) AS act, cost_source "
+    """Per-model aux-task split: one section per billing family, (model:task) rows by calls desc.
+
+    Raw-row Python aggregation, same cost_source rule as fetch_usage.
+    """
+    sql = ("SELECT session_id, model, billing_provider, task, cost_source, api_call_count, "
+           "input_tokens, output_tokens, estimated_cost_usd, actual_cost_usd "
            "FROM session_model_usage WHERE 1=1")
     args: list[object] = []
     if cutoff is not None:
@@ -299,21 +301,22 @@ def render_tasks(conn: sqlite3.Connection, cutoff: float | None,
         marks = ",".join("?" for _ in exclude_sources)
         sql += f" AND session_id IN (SELECT id FROM sessions WHERE source NOT IN ({marks}))"
         args.extend(exclude_sources)
-    sql += " GROUP BY model, billing_provider, task, cost_source"
     conn.row_factory = sqlite3.Row
     merged: dict[tuple[str, str, str], list] = {}
     for r in conn.execute(sql, args):
         key = (normalize_model(r["model"]), r["billing_provider"] or "",
                r["task"] or "(main)")
-        cell = merged.setdefault(key, [0, 0, 0, 0.0, 0.0, r["cost_source"] or ""])
-        cell[0] += r["calls"] or 0
-        cell[1] += r["in_tok"] or 0
-        cell[2] += r["out_tok"] or 0
-        cell[3] += r["est"] or 0.0
-        cell[4] += r["act"] or 0.0
+        cell = merged.setdefault(key, [0, 0, 0, 0.0, 0.0, False])
+        cell[0] += r["api_call_count"] or 0
+        cell[1] += r["input_tokens"] or 0
+        cell[2] += r["output_tokens"] or 0
+        cell[3] += r["estimated_cost_usd"] or 0.0
+        cell[4] += r["actual_cost_usd"] or 0.0
+        cell[5] = cell[5] or (r["cost_source"] == "none")
     rows = [UsageRow(model=m, provider=p, family="", msgs=None, sessions=0,
                      in_tok=c[1], out_tok=c[2], cache_r=0, cache_w=0, think=0,
-                     api_calls=c[0], est_cost=c[3], act_cost=c[4], cost_source=c[5])
+                     api_calls=c[0], est_cost=c[3], act_cost=c[4],
+                     cost_source="none" if (c[3] + c[4] == 0 and c[5]) else "")
             for (m, p, _t), c in merged.items()]
     assign_family(rows, conn)
     fam_by_mp: dict[tuple[str, str], str] = {}
@@ -325,7 +328,8 @@ def render_tasks(conn: sqlite3.Connection, cutoff: float | None,
     lines = ["Per-task split (calls / in / out / est $)"]
     for fam in sorted(groups, key=family_sort_key):
         lines.append(fam)
-        for (m, _p, t), c in sorted(groups[fam], key=lambda kv: kv[1][0], reverse=True):
+        for (m, _p, t), c in sorted(groups[fam], key=lambda kv: (kv[1][0], kv[0][0], kv[0][2]),
+                                    reverse=True):
             label = f"{m}:{t}"
             cost = cost_cell(c[3], c[4], c[5])
             lines.append(f"{label:<42} {c[0]:>6} {fmt_tokens(c[1]):>8} {fmt_tokens(c[2]):>8} {cost:>8}")
@@ -389,9 +393,10 @@ def render_trend(path: Path, days: int) -> str:
         bucket = -(-len(series) // width)
         cell = [sum(series[i * bucket:(i + 1) * bucket]) for i in range(width)]
         total = sum(series)
-        last = series[-1]
+        nz = [d for d in window if m["cost"][d] > 0]
+        last_txt = (f"last ${m['cost'][nz[-1]]:.2f} on {nz[-1]}" if nz else "last $0.00")
         lines.append(f"{model:<32} {sparkline(cell, width)}  ${total:8.2f}  "
-                     f"last ${last:.2f}  out {fmt_tokens(m['out'])}")
+                     f"{last_txt}  out {fmt_tokens(m['out'])}")
     return "\n".join(lines)
 
 
@@ -420,13 +425,17 @@ def main(argv: list[str]) -> int:
 
 def fetch_usage(conn: sqlite3.Connection, cutoff: float | None,
                 exclude_sources: tuple[str, ...] = ()) -> list[UsageRow]:
-    """Aggregate session_model_usage per (normalized model, provider), sorted by tokens desc."""
-    sql = ("SELECT model, billing_provider, cost_source, "
-           "COUNT(DISTINCT session_id) AS sessions, SUM(api_call_count) AS api_calls, "
-           "SUM(input_tokens) AS in_tok, SUM(output_tokens) AS out_tok, "
-           "SUM(cache_read_tokens) AS cache_r, SUM(cache_write_tokens) AS cache_w, "
-           "SUM(reasoning_tokens) AS think, SUM(estimated_cost_usd) AS est_cost, "
-           "SUM(actual_cost_usd) AS act_cost "
+    """Aggregate session_model_usage per (normalized model, provider), sorted by tokens desc.
+
+    One Python pass over raw usage rows: COUNT DISTINCT semantics for sessions are exact
+    across normalized-model and cost_source group splits (SQL group-sum double-counts —
+    live DB: swift 198 distinct vs 355 printed). cost_source='none' wins when the merged
+    cost is zero and any row is unpriced, so unpriced models never render $0.00.
+    """
+    conn.row_factory = sqlite3.Row
+    sql = ("SELECT session_id, model, billing_provider, cost_source, api_call_count, "
+           "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+           "reasoning_tokens, estimated_cost_usd, actual_cost_usd "
            "FROM session_model_usage WHERE 1=1")
     args: list[object] = []
     if cutoff is not None:
@@ -436,33 +445,30 @@ def fetch_usage(conn: sqlite3.Connection, cutoff: float | None,
         marks = ",".join("?" for _ in exclude_sources)
         sql += f" AND session_id IN (SELECT id FROM sessions WHERE source NOT IN ({marks}))"
         args.extend(exclude_sources)
-    sql += " GROUP BY model, billing_provider, cost_source"
 
-    conn.row_factory = sqlite3.Row  # callers may pass a factory-less conn (fixtures, CDP-style reuse)
-    merged: dict[tuple[str, str], UsageRow] = {}
+    agg: dict[tuple[str, str], dict] = {}
     for r in conn.execute(sql, args):
         key = (normalize_model(r["model"]), r["billing_provider"] or "")
-        row = merged.get(key)
-        if row is None:
-            merged[key] = UsageRow(
-                model=key[0], provider=key[1], family="", msgs=None,
-                sessions=r["sessions"], in_tok=r["in_tok"] or 0, out_tok=r["out_tok"] or 0,
-                cache_r=r["cache_r"] or 0, cache_w=r["cache_w"] or 0, think=r["think"] or 0,
-                api_calls=r["api_calls"] or 0, est_cost=r["est_cost"] or 0.0,
-                act_cost=r["act_cost"] or 0.0, cost_source=r["cost_source"] or "")
-            continue
-        # sessions: a session landing in two cost_source groups of one provider/model is
-        # counted twice here; cost_source is provider-stable in practice, so exposure is nil.
-        row.sessions += r["sessions"]
-        row.in_tok += r["in_tok"] or 0
-        row.out_tok += r["out_tok"] or 0
-        row.cache_r += r["cache_r"] or 0
-        row.cache_w += r["cache_w"] or 0
-        row.think += r["think"] or 0
-        row.api_calls += r["api_calls"] or 0
-        row.est_cost += r["est_cost"] or 0.0
-        row.act_cost += r["act_cost"] or 0.0
-    return sorted(merged.values(), key=lambda r: r.in_tok + r.out_tok, reverse=True)
+        a = agg.get(key)
+        if a is None:
+            a = agg[key] = {"sess": set(), "calls": 0, "in": 0, "out": 0, "cr": 0, "cw": 0,
+                            "th": 0, "est": 0.0, "act": 0.0, "has_none": False}
+        a["sess"].add(r["session_id"])
+        a["calls"] += r["api_call_count"] or 0
+        a["in"] += r["input_tokens"] or 0
+        a["out"] += r["output_tokens"] or 0
+        a["cr"] += r["cache_read_tokens"] or 0
+        a["cw"] += r["cache_write_tokens"] or 0
+        a["th"] += r["reasoning_tokens"] or 0
+        a["est"] += r["estimated_cost_usd"] or 0.0
+        a["act"] += r["actual_cost_usd"] or 0.0
+        a["has_none"] = a["has_none"] or (r["cost_source"] == "none")
+    rows = [UsageRow(model=m, provider=p, family="", msgs=None, sessions=len(a["sess"]),
+                     in_tok=a["in"], out_tok=a["out"], cache_r=a["cr"], cache_w=a["cw"],
+                     think=a["th"], api_calls=a["calls"], est_cost=a["est"], act_cost=a["act"],
+                     cost_source="none" if (a["est"] + a["act"] == 0 and a["has_none"]) else "")
+            for (m, p), a in agg.items()]
+    return sorted(rows, key=lambda r: r.in_tok + r.out_tok, reverse=True)
 
 
 if __name__ == "__main__":
