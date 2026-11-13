@@ -204,5 +204,57 @@ class WindowAttribution(unittest.TestCase):
         self.assertEqual(future, {})  # every window row has first_seen < 1.9e9
 
 
+class Report(unittest.TestCase):
+    NOW = 1_700_000_001.0  # 1s after the fixture t; 30d window covers every row
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path, self.conn = make_fixture(self._tmp.name)
+
+    def tearDown(self):
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def test_table_families_subtotals_and_total(self):
+        # Hand calc from fixture: swift in 1000 + opus in (900+50+400)=1350 -> 2350;
+        # out 200 + (300+1+40)=541; est 0+0 + (1.5+0.2+0.5)=2.20 -> $2.20
+        out = hu.build_report(self.conn, hu.parse_args([]), self.NOW)
+        self.assertIn("Claude subscription", out)
+        self.assertIn("── Claude subscription subtotal", out)
+        self.assertIn("── Local subtotal", out)
+        self.assertIn("══ TOTAL", out)
+        total = next(l for l in out.splitlines() if "TOTAL" in l)
+        self.assertIn("2350", total)
+        self.assertIn("541", total)
+        self.assertIn("$2.20", total)
+        swift = next(l for l in out.splitlines() if "swift-1.5-iq3_s" in l)
+        self.assertIn("—", swift)  # unpriced local model: em dash, not $0.00
+
+    def test_table_msgs_from_windows(self):
+        out = hu.build_report(self.conn, hu.parse_args([]), self.NOW)
+        swift = next(l for l in out.splitlines() if "swift-1.5-iq3_s" in l)
+        cells = swift.split()
+        # swift cells: model sessions msgs in out cacheR cacheW think cost = 9 tokens
+        self.assertEqual(len(cells), 9)
+        self.assertEqual(cells[2], "5")   # fixture swift window: 5 msgs
+        opus = next(l for l in out.splitlines() if l.strip().startswith("claude-opus-5-5 "))
+        self.assertEqual(opus.split()[2], "8")  # 6 (s2) + 2 (s3)
+
+    def test_table_footnote_on_session_double_count(self):
+        # fixture: swift spans s1+s2, opus spans s2+s3 -> Sess column sums to 4 over 3 distinct
+        out = hu.build_report(self.conn, hu.parse_args([]), self.NOW)
+        self.assertIn("sessions counted per model", out)
+
+    def test_window_flag_parsing(self):
+        a = hu.parse_args(["--week"])
+        self.assertEqual(a.window, "week")
+        a = hu.parse_args(["--days", "3"])
+        self.assertEqual((a.window, a.days), ("days", 3))
+        self.assertEqual(hu.parse_args([]).days, 30)
+        self.assertTrue(hu.parse_args(["--user"]).user)
+        with self.assertRaises(SystemExit):
+            hu.parse_args(["--week", "--all"])
+
+
 if __name__ == "__main__":
     unittest.main()

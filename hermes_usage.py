@@ -1,9 +1,12 @@
+#!/usr/bin/env python3
 """hermes-usage: terminal usage dashboard for Hermes, over read-only state.db."""
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -168,6 +171,115 @@ def fetch_msgs(conn: sqlite3.Connection, cutoff: float | None,
     return counts
 
 
+USER_SOURCES = ("subagent", "cron", "tool", "oneshot")
+
+_COLUMNS = (("Model", 34, "<"), ("Sess", 5, ">"), ("Msgs", 6, ">"), ("In", 8, ">"),
+            ("Out", 8, ">"), ("Cache R", 9, ">"), ("Cache W", 9, ">"), ("Think", 8, ">"),
+            ("Est. $", 8, ">"))
+
+
+def _cells(model: str, sessions: int, msgs: int, r_in: int, out: int, cr: int, cw: int,
+           think: int, cost: str) -> str:
+    name = model if len(model) <= 34 else model[:33] + "…"
+    vals = (name, str(sessions), str(msgs), fmt_tokens(r_in), fmt_tokens(out),
+            fmt_tokens(cr), fmt_tokens(cw), fmt_tokens(think), cost)
+    return " ".join(v.rjust(w) if al == ">" else v.ljust(w)
+                    for v, (_, w, al) in zip(vals, _COLUMNS)).rstrip()
+
+
+def _sum_row(rows: list[UsageRow]) -> tuple:
+    cost = cost_cell(sum(r.est_cost for r in rows), sum(r.act_cost for r in rows),
+                     "none" if rows and all(r.cost_source == "none" for r in rows) else "")
+    return (sum(r.sessions for r in rows), sum(r.msgs or 0 for r in rows),
+            sum(r.in_tok for r in rows), sum(r.out_tok for r in rows),
+            sum(r.cache_r for r in rows), sum(r.cache_w for r in rows),
+            sum(r.think for r in rows), cost)
+
+
+def family_sort_key(fam: str) -> tuple[int, str]:
+    return (FAMILY_ORDER.index(fam) if fam in FAMILY_ORDER else len(FAMILY_ORDER), fam)
+
+
+def render_table(rows: list[UsageRow], period_label: str) -> str:
+    header = " ".join(h.ljust(w) if i == 0 else h.rjust(w)
+                      for i, (h, w, _) in enumerate(_COLUMNS)).rstrip()
+    lines = [f"Hermes usage — {period_label}", header]
+    groups: dict[str, list[UsageRow]] = {}
+    for r in rows:
+        groups.setdefault(r.family, []).append(r)
+    for fam in sorted(groups, key=family_sort_key):
+        lines.append(fam)
+        for r in groups[fam]:
+            lines.append(_cells(r.model, r.sessions, r.msgs or 0, r.in_tok, r.out_tok,
+                                r.cache_r, r.cache_w, r.think, cost_cell(r.est_cost, r.act_cost, r.cost_source)))
+        s = _sum_row(groups[fam])
+        lines.append(_cells(f"── {fam} subtotal", *s))
+    if groups:
+        t = _sum_row([r for g in groups.values() for r in g])
+        lines.append(_cells("══ TOTAL", *t))
+        lines.append("note: sessions counted per model (a model-switching session counts twice); "
+                     "header shows distinct sessions")
+    return "\n".join(lines)
+
+
+class _DaysAction(argparse.Action):
+    def __call__(self, parser, ns, values, option_string=None):
+        setattr(ns, self.dest, values)
+        ns.window = "days"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="hermes-usage",
+                                description="Per-model Hermes usage over read-only state.db")
+    w = p.add_mutually_exclusive_group()
+    w.add_argument("--today", dest="window", action="store_const", const="today")
+    w.add_argument("--week", dest="window", action="store_const", const="week")
+    w.add_argument("--month", dest="window", action="store_const", const="month")
+    w.add_argument("--all", dest="window", action="store_const", const="all")
+    p.add_argument("--days", type=int, default=30, action=_DaysAction)
+    p.add_argument("--user", action="store_true",
+                   help="exclude subagent/cron/tool/oneshot sessions")
+    p.add_argument("--tasks", action="store_true", help="per-model aux-task split")
+    p.add_argument("--live", action="store_true", help="re-render every 5s")
+    p.add_argument("--trend", type=int, metavar="N", default=None,
+                   help="daily rollup sparklines, last N days")
+    p.add_argument("--ticks", type=int, default=None, help=argparse.SUPPRESS)
+    p.set_defaults(window="month")
+    return p.parse_args(argv)
+
+
+def build_report(conn: sqlite3.Connection, args: argparse.Namespace, now: float) -> str:
+    cutoff = window_start(args.window, args.days, now)
+    excl = USER_SOURCES if args.user else ()
+    rows = fetch_usage(conn, cutoff, excl)
+    assign_family(rows, conn)
+    counts = fetch_msgs(conn, cutoff, excl)
+    for r in rows:
+        r.msgs = counts.get((r.model, r.provider), 0)
+    if args.window == "all":
+        label = "all time"
+    elif args.window == "today":
+        label = "today"
+    elif args.window == "week":
+        label = "last 7 days"
+    elif args.window == "month":
+        label = "last 30 days"
+    else:
+        label = f"last {args.days} days"
+    q = "SELECT COUNT(DISTINCT session_id) FROM session_model_usage" + \
+        (" WHERE first_seen >= ?" if cutoff is not None else "")
+    n = conn.execute(q, (cutoff,) if cutoff is not None else ()).fetchone()[0]
+    scope = "user sessions only" if args.user else "incl. subagents, cron, one-shots"
+    return render_table(rows, f"{label} · {n} sessions · {scope}")
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv[1:])
+    conn = connect_ro()
+    print(build_report(conn, args, datetime.now().timestamp()))
+    return 0
+
+
 def fetch_usage(conn: sqlite3.Connection, cutoff: float | None,
                 exclude_sources: tuple[str, ...] = ()) -> list[UsageRow]:
     """Aggregate session_model_usage per (normalized model, provider), sorted by tokens desc."""
@@ -213,3 +325,7 @@ def fetch_usage(conn: sqlite3.Connection, cutoff: float | None,
         row.est_cost += r["est_cost"] or 0.0
         row.act_cost += r["act_cost"] or 0.0
     return sorted(merged.values(), key=lambda r: r.in_tok + r.out_tok, reverse=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
