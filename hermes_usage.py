@@ -121,6 +121,53 @@ def fmt_tokens(n: int) -> str:
     return str(n)
 
 
+def fetch_msgs(conn: sqlite3.Connection, cutoff: float | None,
+               exclude_sources: tuple[str, ...] = ()) -> dict[tuple[str, str], int]:
+    """Msg counts per (normalized model, provider) by window attribution.
+
+    Approximate by construction (spec): each user/assistant message is attributed to the
+    latest-starting main-conversation window (task='') of its session covering the message
+    timestamp; messages outside every window are dropped.
+    """
+    conn.row_factory = sqlite3.Row
+    wsql = ("SELECT session_id, model, billing_provider, first_seen, last_seen "
+            "FROM session_model_usage WHERE task=''")
+    args: list[object] = []
+    if cutoff is not None:
+        wsql += " AND first_seen >= ?"
+        args.append(cutoff)
+    if exclude_sources:
+        marks = ",".join("?" for _ in exclude_sources)
+        wsql += f" AND session_id IN (SELECT id FROM sessions WHERE source NOT IN ({marks}))"
+        args.extend(exclude_sources)
+    windows: dict[str, list[tuple[float, float, tuple[str, str]]]] = {}
+    for r in conn.execute(wsql, args):
+        key = (normalize_model(r["model"]), r["billing_provider"] or "")
+        sess = windows.setdefault(r["session_id"], [])
+        win = next((w for w in sess if w[2] == key), None)
+        if win is None:
+            sess.append((r["first_seen"] or 0.0, r["last_seen"] or 0.0, key))
+        else:  # merge duplicate (session, model, provider) rows: widen [min, max]
+            i = sess.index(win)
+            sess[i] = (min(win[0], r["first_seen"] or 0.0), max(win[1], r["last_seen"] or 0.0), key)
+
+    counts: dict[tuple[str, str], int] = {}
+    seen: set[tuple] = set()
+    for m in conn.execute("SELECT session_id, role, timestamp, display_order, content, tool_calls "
+                          "FROM messages WHERE role IN ('user','assistant') AND (active=1 OR compacted=1)"):
+        dedupe = (m["session_id"], m["display_order"], m["role"], m["content"], m["tool_calls"])
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        ts = m["timestamp"]
+        covering = [w for w in windows.get(m["session_id"], []) if w[0] <= ts <= w[1]]
+        if not covering:
+            continue
+        key = max(covering, key=lambda w: w[0])[2]  # tie/overlap: latest window wins
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def fetch_usage(conn: sqlite3.Connection, cutoff: float | None,
                 exclude_sources: tuple[str, ...] = ()) -> list[UsageRow]:
     """Aggregate session_model_usage per (normalized model, provider), sorted by tokens desc."""
