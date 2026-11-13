@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -273,9 +274,84 @@ def build_report(conn: sqlite3.Connection, args: argparse.Namespace, now: float)
     return render_table(rows, f"{label} · {n} sessions · {scope}")
 
 
+def render_tasks(conn: sqlite3.Connection, cutoff: float | None,
+                 exclude_sources: tuple[str, ...]) -> str:
+    """Per-model aux-task split: one section per billing family, (model:task) rows by calls desc."""
+    sql = ("SELECT model, billing_provider, task, SUM(api_call_count) AS calls, "
+           "SUM(input_tokens) AS in_tok, SUM(output_tokens) AS out_tok, "
+           "SUM(estimated_cost_usd) AS est, SUM(actual_cost_usd) AS act, cost_source "
+           "FROM session_model_usage WHERE 1=1")
+    args: list[object] = []
+    if cutoff is not None:
+        sql += " AND first_seen >= ?"
+        args.append(cutoff)
+    if exclude_sources:
+        marks = ",".join("?" for _ in exclude_sources)
+        sql += f" AND session_id IN (SELECT id FROM sessions WHERE source NOT IN ({marks}))"
+        args.extend(exclude_sources)
+    sql += " GROUP BY model, billing_provider, task, cost_source"
+    conn.row_factory = sqlite3.Row
+    merged: dict[tuple[str, str, str], list] = {}
+    for r in conn.execute(sql, args):
+        key = (normalize_model(r["model"]), r["billing_provider"] or "",
+               r["task"] or "(main)")
+        cell = merged.setdefault(key, [0, 0, 0, 0.0, 0.0, r["cost_source"] or ""])
+        cell[0] += r["calls"] or 0
+        cell[1] += r["in_tok"] or 0
+        cell[2] += r["out_tok"] or 0
+        cell[3] += r["est"] or 0.0
+        cell[4] += r["act"] or 0.0
+    rows = [UsageRow(model=m, provider=p, family="", msgs=None, sessions=0,
+                     in_tok=c[1], out_tok=c[2], cache_r=0, cache_w=0, think=0,
+                     api_calls=c[0], est_cost=c[3], act_cost=c[4], cost_source=c[5])
+            for (m, p, _t), c in merged.items()]
+    assign_family(rows, conn)
+    fam_by_mp: dict[tuple[str, str], str] = {}
+    for (m, p, _t), r in zip(merged.keys(), rows):  # dicts preserve insertion order
+        fam_by_mp[(m, p)] = r.family
+    groups: dict[str, list[tuple[tuple, list]]] = {}
+    for key, c in merged.items():
+        groups.setdefault(fam_by_mp[(key[0], key[1])], []).append((key, c))
+    lines = ["Per-task split (calls / in / out / est $)"]
+    for fam in sorted(groups, key=family_sort_key):
+        lines.append(fam)
+        for (m, _p, t), c in sorted(groups[fam], key=lambda kv: kv[1][0], reverse=True):
+            label = f"{m}:{t}"
+            cost = cost_cell(c[3], c[4], c[5])
+            lines.append(f"{label:<42} {c[0]:>6} {fmt_tokens(c[1]):>8} {fmt_tokens(c[2]):>8} {cost:>8}")
+    return "\n".join(lines)
+
+
+def run_live(conn_factory, args: argparse.Namespace, render, sleep=time.sleep,
+             clear=None, ticks: int | None = None) -> int:
+    """Re-render loop: clear, render, sleep 5s. Locked DB -> one-line skip, loop continues."""
+    count = 0
+    while ticks is None or count < ticks:
+        count += 1
+        sys.stdout.write(clear() if clear else "\x1b[2J\x1b[H")
+        sys.stdout.flush()
+        try:
+            print(render(conn_factory()))
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc):
+                print("usage: tick skipped (database busy)")
+            else:
+                raise
+        sleep(5)
+    return 0
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv[1:])
     conn = connect_ro()
+    if args.tasks:
+        cutoff = window_start(args.window, args.days, datetime.now().timestamp())
+        print(render_tasks(conn, cutoff, USER_SOURCES if args.user else ()))
+        return 0
+    if args.live:
+        return run_live(lambda: connect_ro(), args,
+                        lambda c: build_report(c, args, datetime.now().timestamp()),
+                        ticks=args.ticks)
     print(build_report(conn, args, datetime.now().timestamp()))
     return 0
 

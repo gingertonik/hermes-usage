@@ -3,6 +3,8 @@
 Oracle notes: every expected value below is a hand calculation from the fixture
 INSERTs, cited in comments; none was produced by running the implementation.
 """
+import contextlib
+import io
 import sqlite3
 import tempfile
 import time
@@ -254,6 +256,67 @@ class Report(unittest.TestCase):
         self.assertTrue(hu.parse_args(["--user"]).user)
         with self.assertRaises(SystemExit):
             hu.parse_args(["--week", "--all"])
+
+
+class Tasks(unittest.TestCase):
+    NOW = 1_700_000_001.0
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path, self.conn = make_fixture(self._tmp.name)
+
+    def tearDown(self):
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def test_tasks_split(self):
+        out = hu.render_tasks(self.conn, None, ())
+        self.assertIn("(main)", out)
+        self.assertIn("approval", out)
+        # fixture s2 approval row: 2 calls, in 50, out 1, est 0.2 -> $0.20
+        line = next(l for l in out.splitlines() if "approval" in l)
+        self.assertEqual(line.split()[1:], ["2", "50", "1", "$0.20"])
+        main_opus = next(l for l in out.splitlines()
+                         if "claude-opus-5-5" in l and "(main)" in l)
+        # expected 10: 7 (s2 main) + 3 (s3 main); in 900+400=1300
+        self.assertEqual(main_opus.split()[1], "10")
+
+    def test_tasks_source_filter_drops_approval_row(self):
+        out = hu.render_tasks(self.conn, None, ("subagent",))
+        self.assertIn("approval", out)  # s2 approval survives
+        s3_main = [l for l in out.splitlines() if "(main)" in l and "claude-opus" in l]
+        # after dropping s3: opus main = 7 calls (only s2), single opus main line
+        self.assertEqual(len(s3_main), 1)
+        self.assertEqual(s3_main[0].split()[1], "7")
+
+
+class Live(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path, self.conn = make_fixture(self._tmp.name)
+
+    def tearDown(self):
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def test_live_loop_survives_locked_tick(self):
+        conns = [self.conn, "LOCK", self.conn]
+
+        def factory():
+            item = conns.pop(0)
+            if item == "LOCK":
+                raise sqlite3.OperationalError("database is locked")
+            return item
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = hu.run_live(factory, hu.parse_args([]), lambda c: "REPORT",
+                             sleep=lambda s: None, clear=lambda: "CLEAR", ticks=3)
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count("REPORT"), 2)
+        self.assertIn("usage: tick skipped (database busy)", out)
+        self.assertEqual(out.count("CLEAR"), 3)  # screen cleared every tick
 
 
 if __name__ == "__main__":
