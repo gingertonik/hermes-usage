@@ -98,5 +98,49 @@ class DataLayer(unittest.TestCase):
         self.assertIsNone(hu.window_start("all", 30, now))
 
 
+class Grouping(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path, self.conn = make_fixture(self._tmp.name)
+
+    def tearDown(self):
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def test_family_exact_provider_values(self):
+        self.assertEqual(hu.family_for("claude-subscription-directsdk-experimental", "", "claude-opus-5-5"),
+                         "Claude subscription")
+        self.assertEqual(hu.family_for("custom", "http://127.0.0.1:8081/v1", "swift-1.5-iq3_s"), "Local")
+        self.assertEqual(hu.family_for("custom", "", "swift-1.5-iq3_s"), "Local")
+        self.assertEqual(hu.family_for("", "", "gpt-oss:20b"), "Unknown")
+        self.assertEqual(hu.family_for("openrouter", "", "x"), "openrouter")
+
+    def test_unknown_model_and_provider_reaches_total(self):
+        t = 1_700_000_000.0
+        # expected: model '(unknown)' with exactly 100 in_tok (this INSERT), family 'Unknown'
+        self.conn.execute("INSERT INTO session_model_usage VALUES ('s9','','','','','',"
+                          "1,100,0,0,0,0,0,0,'',?,?)", (t, t + 10))
+        self.conn.commit()
+        rows = {r.model: r for r in hu.fetch_usage(self.conn, None)}
+        self.assertIn("(unknown)", rows)
+        self.assertEqual(rows["(unknown)"].in_tok, 100)
+        hu.assign_family(list(rows.values()), self.conn)
+        self.assertEqual(rows["(unknown)"].family, "Unknown")
+        self.assertEqual(rows["swift-1.5-iq3_s"].family, "Local")
+        self.assertEqual(rows["claude-opus-5-5"].family, "Claude subscription")
+
+    def test_cost_cell_precedence(self):
+        self.assertEqual(hu.cost_cell(3.40, 1.20, ""), "$1.20")
+        self.assertEqual(hu.cost_cell(3.40, 0.0, ""), "$3.40")
+        self.assertEqual(hu.cost_cell(0.0, 0.0, "none"), "—")
+        self.assertEqual(hu.cost_cell(0.0, 0.0, ""), "$0.00")  # priced, genuinely zero
+
+    def test_fmt_tokens(self):
+        self.assertEqual(hu.fmt_tokens(4_570_000), "4.57M")
+        self.assertEqual(hu.fmt_tokens(812_000), "812K")
+        self.assertEqual(hu.fmt_tokens(999), "999")
+        self.assertEqual(hu.fmt_tokens(2_350), "2350")  # < 100K stays raw: 0dp K would print "2K"
+
+
 if __name__ == "__main__":
     unittest.main()

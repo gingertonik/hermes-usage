@@ -69,6 +69,58 @@ class UsageRow:
     cost_source: str
 
 
+def family_for(provider: str, base_url: str, model: str) -> str:
+    """Billing family from exact DB values (spec-pinned mapping)."""
+    if provider.startswith("claude-subscription"):
+        return "Claude subscription"
+    if provider == "custom":
+        return "Local"
+    if not provider:
+        return "Unknown"
+    return provider
+
+
+FAMILY_ORDER = ["Claude subscription", "Local", "Unknown"]
+
+
+def assign_family(rows: list[UsageRow], conn: sqlite3.Connection) -> None:
+    """Fill row.family in place, keyed on the dominant billing_base_url per (model, provider)."""
+    conn.row_factory = sqlite3.Row
+    urls: dict[tuple[str, str], tuple[str, int]] = {}
+    q = ("SELECT model, billing_provider, billing_base_url, "
+         "SUM(input_tokens)+SUM(output_tokens) AS toks, COUNT(*) AS n "
+         "FROM session_model_usage GROUP BY 1, 2, 3")
+    for r in conn.execute(q):
+        key = (normalize_model(r["model"]), r["billing_provider"] or "")
+        weight = (r["toks"] or 0) + r["n"]  # +n: break all-zero-token ties by row count
+        best = urls.get(key)
+        if best is None or weight > best[1]:
+            urls[key] = (r["billing_base_url"] or "", weight)
+    for row in rows:
+        base_url = urls.get((row.model, row.provider), ("", 0))[0]
+        row.family = family_for(row.provider, base_url, row.model)
+
+
+def cost_cell(est: float, act: float, cost_source: str | None) -> str:
+    """Money cell: actual wins over estimated; unpriced (cost_source='none', zero cost) is an em dash."""
+    if act > 0:
+        return f"${act:.2f}"
+    if est > 0:
+        return f"${est:.2f}"
+    if cost_source == "none":
+        return "—"
+    return "$0.00"
+
+
+def fmt_tokens(n: int) -> str:
+    """Token count: M at >=1M (2dp), integer K at >=100K, raw below (0dp K would print 2350 as '2K')."""
+    if n >= 1_000_000:
+        return f"{n / 1e6:.2f}M"
+    if n >= 100_000:
+        return f"{n // 1000}K"
+    return str(n)
+
+
 def fetch_usage(conn: sqlite3.Connection, cutoff: float | None,
                 exclude_sources: tuple[str, ...] = ()) -> list[UsageRow]:
     """Aggregate session_model_usage per (normalized model, provider), sorted by tokens desc."""
