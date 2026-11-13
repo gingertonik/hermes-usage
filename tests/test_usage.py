@@ -5,7 +5,9 @@ INSERTs, cited in comments; none was produced by running the implementation.
 """
 import contextlib
 import io
+import json
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -247,6 +249,13 @@ class Report(unittest.TestCase):
         out = hu.build_report(self.conn, hu.parse_args([]), self.NOW)
         self.assertIn("sessions counted per model", out)
 
+    def test_header_session_count_respects_user_filter(self):
+        # fixture: 3 distinct sessions (s1,s2,s3); s3 is source='subagent' -> user-only = 2
+        out_all = hu.build_report(self.conn, hu.parse_args([]), self.NOW)
+        self.assertIn("3 sessions", out_all)
+        out_user = hu.build_report(self.conn, hu.parse_args(["--user"]), self.NOW)
+        self.assertIn("2 sessions · user sessions only", out_user)
+
     def test_window_flag_parsing(self):
         a = hu.parse_args(["--week"])
         self.assertEqual(a.window, "week")
@@ -317,6 +326,60 @@ class Live(unittest.TestCase):
         self.assertEqual(out.count("REPORT"), 2)
         self.assertIn("usage: tick skipped (database busy)", out)
         self.assertEqual(out.count("CLEAR"), 3)  # screen cleared every tick
+
+
+class Trend(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path, self.conn = make_fixture(self._tmp.name)
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        import rollup  # noqa: local import so path bootstrap applies
+        self.rollup = rollup
+
+    def tearDown(self):
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def test_rollup_day_pinned_sums(self):
+        from datetime import datetime
+        # oracle: fixture rows all first_seen at/beside t=1.7e9, same local calendar day
+        date_str = datetime.fromtimestamp(1_700_000_000).date().isoformat()
+        rows = {r["model"]: r for r in self.rollup.rollup_day(self.conn, date_str)}
+        swift = rows["swift-1.5-iq3_s"]
+        self.assertEqual((swift["sessions"], swift["api_calls"], swift["in_tok"], swift["out_tok"]),
+                         (2, 11, 1000, 200))
+        opus = rows["claude-opus-5-5"]
+        self.assertEqual((opus["sessions"], opus["api_calls"]), (2, 12))
+        self.assertAlmostEqual(opus["est_cost"], 2.2, places=6)  # 1.5 + 0.2 + 0.5
+
+    def test_write_rollup_idempotent(self):
+        from datetime import datetime
+        date_str = datetime.fromtimestamp(1_700_000_000).date().isoformat()
+        out = Path(self._tmp.name) / "usage_daily.jsonl"
+        n1 = self.rollup.write_rollup(self.conn, out, date_str)
+        n2 = self.rollup.write_rollup(self.conn, out, date_str)
+        self.assertEqual((n1, n2), (2, 2))
+        lines = [json.loads(l) for l in out.read_text().splitlines()]
+        self.assertEqual(len(lines), 2)  # rerun replaces the day, never duplicates
+
+    def test_sparkline(self):
+        self.assertEqual(hu.sparkline([0, 5, 10], 3), "▁▅█")  # idx 0, round(3.5)=4, 7
+        self.assertEqual(hu.sparkline([0, 0], 2), "▁▁")
+
+    def test_render_trend_missing_file(self):
+        missing = Path(self._tmp.name) / "nope.jsonl"
+        self.assertIn(str(missing), hu.render_trend(missing, 30))
+
+    def test_main_trend_exit_zero(self):
+        # --trend must render the trend view (note line pre-rollup), not the table
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = hu.main(["hermes-usage", "--trend", "30"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertTrue("no rollup yet:" in out or "Daily est-cost trend" in out,
+                        f"got table/other output: {out[:80]!r}")
+        self.assertNotIn("══ TOTAL", out)
 
 
 if __name__ == "__main__":

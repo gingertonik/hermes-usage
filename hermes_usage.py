@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 _BRACKET_SUFFIX = re.compile(r"\[[^\]]*\]$")
@@ -267,9 +268,18 @@ def build_report(conn: sqlite3.Connection, args: argparse.Namespace, now: float)
         label = "last 30 days"
     else:
         label = f"last {args.days} days"
-    q = "SELECT COUNT(DISTINCT session_id) FROM session_model_usage" + \
-        (" WHERE first_seen >= ?" if cutoff is not None else "")
-    n = conn.execute(q, (cutoff,) if cutoff is not None else ()).fetchone()[0]
+    q = "SELECT COUNT(DISTINCT session_id) FROM session_model_usage"
+    where, qargs = [], []
+    if cutoff is not None:
+        where.append("first_seen >= ?")
+        qargs.append(cutoff)
+    if excl:
+        marks = ",".join("?" for _ in excl)
+        where.append(f"session_id IN (SELECT id FROM sessions WHERE source NOT IN ({marks}))")
+        qargs.extend(excl)
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    n = conn.execute(q, qargs).fetchone()[0]
     scope = "user sessions only" if args.user else "incl. subagents, cron, one-shots"
     return render_table(rows, f"{label} · {n} sessions · {scope}")
 
@@ -341,9 +351,61 @@ def run_live(conn_factory, args: argparse.Namespace, render, sleep=time.sleep,
     return 0
 
 
+_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: list[float], width: int) -> str:
+    """Eight-block spark, linear to max; all-zero series is all '▁'."""
+    vals = (values + [0] * width)[:width]
+    mx = max(vals)
+    if mx <= 0:
+        return _SPARK[0] * len(vals)
+    return "".join(_SPARK[min(7, max(0, round(v / mx * 7)))] for v in vals)
+
+
+def render_trend(path: Path, days: int) -> str:
+    """Per-model daily est-cost sparklines over the last N days from the rollup JSONL."""
+    if not path.exists():
+        return f"no rollup yet: {path}"
+    today = datetime.now().date()
+    window = [(today - timedelta(days=i)).isoformat() for i in range(days)][::-1]
+    by_model: dict[str, dict[str, list]] = {}
+    for line in path.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if r.get("date") not in window:
+            continue
+        m = by_model.setdefault(r.get("model", "(unknown)"),
+                                {"cost": {d: 0.0 for d in window}, "out": 0})
+        m["cost"][r["date"]] += r.get("est_cost", 0.0) + r.get("act_cost", 0.0)
+        m["out"] += r.get("out_tok", 0)
+    width = min(days, 60)
+    lines = [f"Daily est-cost trend, last {days} days (spark width {width})"]
+    for model in sorted(by_model, key=lambda k: -sum(by_model[k]["cost"].values())):
+        m = by_model[model]
+        series = [m["cost"][d] for d in window]
+        bucket = -(-len(series) // width)
+        cell = [sum(series[i * bucket:(i + 1) * bucket]) for i in range(width)]
+        total = sum(series)
+        last = series[-1]
+        lines.append(f"{model:<32} {sparkline(cell, width)}  ${total:8.2f}  "
+                     f"last ${last:.2f}  out {fmt_tokens(m['out'])}")
+    return "\n".join(lines)
+
+
+def trend_path() -> Path:
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    return home / "cache" / "usage_daily.jsonl"
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv[1:])
     conn = connect_ro()
+    if args.trend is not None:
+        print(render_trend(trend_path(), args.trend))
+        return 0
     if args.tasks:
         cutoff = window_start(args.window, args.days, datetime.now().timestamp())
         print(render_tasks(conn, cutoff, USER_SOURCES if args.user else ()))
